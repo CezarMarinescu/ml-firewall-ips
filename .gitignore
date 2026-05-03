@@ -1,0 +1,28 @@
+# Secrets — NEVER commit these
+.env
+.env.local
+.env.*.local
+
+# Generated data
+data/*.csv
+data/*.json
+data/*.pkl
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pkl
+
+# IDE
+.idea/
+.vscode/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
