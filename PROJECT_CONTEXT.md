@@ -5,6 +5,9 @@
 > message in a new chat, along with any scripts and CSV samples relevant to the
 > current task. The previous Claude does not have memory between chats — this
 > document IS the memory.
+>
+> **This file is committed to a public GitHub repo, so it MUST NOT contain
+> real credentials.** All credentials live only in `.env` (gitignored).
 
 ---
 
@@ -22,8 +25,9 @@ The user wants this to be both a working system AND a learning project — expla
 should teach networking and ML fundamentals along the way, not just dump code.
 
 The user has fundamentals in networking (nmap, IPs, ports, TCP/UDP, MAC addresses)
-and is learning more. The user is comfortable in both English and Romanian and has
-chosen to continue in English.
+and is comfortable in both English and Romanian. Conversation is in English.
+
+**GitHub:** https://github.com/CezarMarinescu/ml-firewall-ips (public)
 
 ---
 
@@ -31,23 +35,29 @@ chosen to continue in English.
 
 **Three machines on a host-only VirtualBox network (`192.168.56.0/24`):**
 
-| Role | OS | IP | User | Purpose |
-|------|------|------|------|---------|
-| Server | Ubuntu 24.04 | `192.168.56.102` | (see .env) | Runs iptables LOG sensor, gets attacked |
-| Attacker | Kali Linux | `192.168.56.103` | (see .env) | Generates malicious traffic |
-| Operator | Windows + PyCharm | host | (user) | Runs Python scripts, SSH-orchestrates everything |
+| Role | OS | IP | Purpose |
+|------|------|------|---------|
+| Server | Ubuntu 24.04 | `192.168.56.102` | Runs iptables LOG sensor, gets attacked. Now also runs **nginx** on port 80 (added Phase 2D). |
+| Attacker | Kali Linux | `192.168.56.103` | Generates malicious traffic. SSH server enabled (port 22). |
+| Operator | Windows + PyCharm | host (`192.168.56.1` on host-only adapter) | Runs Python scripts, SSH-orchestrates everything, also generates benign traffic |
 
-**Important quirk — VirtualBox dual NIC:**
+Credentials for both VMs are in `.env` (gitignored). See `.env.example` in repo
+for the variable structure.
+
+**Important quirk — VirtualBox dual NIC on Ubuntu:**
 
 The Ubuntu VM has TWO network interfaces:
 - `enp0s3` (NAT, IP `10.0.2.15`) — outbound internet, used for `apt update` etc.
 - `enp0s8` (Host-Only, IP `192.168.56.102`) — VM-to-VM lab traffic
 
 The firewall logs BOTH interfaces, so logs include real internet noise (Canonical
-update servers, DNS replies from `10.0.2.3`, etc.) mixed with lab traffic. This is
-tolerable as benign baseline noise but worth knowing.
+update servers, DNS replies from `10.0.2.3`, AWS heartbeats, CDN responses) mixed
+with lab traffic. This is desirable as benign baseline noise but worth knowing.
 
-**Credentials are stored in `.env`** (gitignored) — see Section 4.
+**Localhost noise:** `127.0.0.1` traffic appears in logs because nginx and other
+local services chatter on the loopback. **Important:** Phase 4's blocking logic
+MUST exclude 127.0.0.1, the operator IP (192.168.56.1), and probably the NAT
+gateway (10.0.2.x) from blocking — see Section 11.
 
 ---
 
@@ -55,34 +65,43 @@ tolerable as benign baseline noise but worth knowing.
 
 ```
 AI_IDS_Project/
-├── .venv/                          # Python virtual environment
-├── data/
-│   ├── .gitkeep
-│   └── flows.csv                   # Output of collect_data.py
+├── .venv/                          # Python virtual environment (gitignored)
+├── data/                           # All gitignored
+│   ├── flows.csv                   # Raw flow output of collect_data
+│   ├── flows_labeled.csv           # Flows with manifest-based labels
+│   ├── attack_manifest.json        # Ground-truth attack timestamps
+│   └── benign_manifest.json        # Ground-truth benign-active session timestamps
 ├── scripts/
 │   ├── __init__.py
-│   └── collect_data.py             # Phase 1 entry point
+│   ├── collect_data.py             # SSH to server, parse logs, build flows
+│   ├── simulate_attacks.py         # Phase 2C — orchestrate attack suite from Kali
+│   ├── generate_benign.py          # Phase 2D — generate benign traffic from Windows host
+│   ├── relabel_with_manifest.py    # Re-label existing flows.csv from manifests
+│   └── test_connections.py         # SSH smoke test for both VMs
 ├── src/
 │   ├── __init__.py
-│   ├── fw_parser.py                # Parses FW_LOG lines from kern.log
-│   ├── flow_features.py            # Aggregates packets into time-windowed flows
-│   └── ssh_client.py               # SSH context manager using .env credentials
-├── .env                            # SERVER_HOST, SERVER_USER, SERVER_PASSWORD
+│   ├── fw_parser.py                # Parse FW_LOG lines (handles ISO 8601 + legacy)
+│   ├── flow_features.py            # Aggregate packets into flows, label from manifests
+│   ├── attack_orchestrator.py      # AttackOrchestrator class + server-clock timing
+│   └── ssh_client.py               # SSH context managers (ssh_connection, kali_connection)
+├── .env                            # SECRETS — gitignored
+├── .env.example                    # Sanitized template (in repo)
 ├── .gitignore
+├── LICENSE                         # MIT
+├── PROJECT_CONTEXT.md              # this file
+├── README.md                       # Public-facing project description
 └── requirements.txt                # paramiko, pandas, scikit-learn, joblib, python-dotenv, numpy
 ```
 
-**Files NOT yet created (planned for Phase 2+):**
-- `scripts/train_ai.py` — retrained for new feature set (old version exists but obsolete)
-- `scripts/ai_agent_live.py` — same, needs full rewrite for new pipeline
-- `scripts/simulate_attacks.py` — Phase 2 attack orchestrator
-- `scripts/generate_benign.py` — Phase 2 benign traffic generator
-- `data/attack_manifest.json` — Phase 2 ground-truth labels
+**Files NOT yet created (planned):**
+- `scripts/train_ai.py` — needs full rewrite for new feature set (old version was deleted)
+- `scripts/ai_agent_live.py` — same, full rewrite for Phase 4
+- Any model files (`*.pkl`)
 - Reporting/dashboard layer (Phase 6)
 
 ---
 
-## 4. Server configuration (already done)
+## 4. Server-side configuration (already done)
 
 **iptables LOG rule active on Ubuntu server:**
 ```bash
@@ -90,61 +109,110 @@ sudo iptables -F
 sudo iptables -A INPUT -j LOG --log-prefix "FW_LOG: "
 ```
 
-**Passwordless sudo configured for specific commands** (`sudo visudo`):
+**Passwordless sudo on Ubuntu (`sudo visudo`):**
 ```
 admin-ai ALL=(ALL) NOPASSWD: /usr/bin/grep, /bin/grep, /usr/sbin/iptables, /usr/sbin/ipset
 ```
+
+**Passwordless sudo on Kali (`sudo visudo`):**
+```
+attacker ALL=(ALL) NOPASSWD: /usr/bin/nmap, /usr/sbin/hping3, /usr/bin/hydra, /usr/bin/timeout
+```
+
+**Kali tools installed:** nmap, hping3, hydra, paramiko (Python).
+
+**Kali helper script:** `~/attack_tools/ssh_bruteforce.py` — paramiko-based brute
+force simulator used by `simulate_attacks.py`.
+
+**Ubuntu services running:** sshd, nginx (with `/var/www/html/test.json` test endpoint).
 
 **Log location:** `/var/log/kern.log` — uses **modern ISO 8601 timestamps**
 (`2026-04-28T19:45:41.290900+03:00`), NOT legacy syslog format. Parser handles both.
 
 ---
 
-## 5. What's been completed — Phase 1 ✅
+## 5. What's been completed
 
-**Goal achieved:** Replaced per-packet ML (which was effectively a hard-coded rule)
-with per-flow ML using behavioral features aggregated over 60-second windows.
+### ✅ Phase 1 — Flow-based feature extraction
 
-**Key conceptual shift:** Old design asked "is THIS PACKET malicious?" — impossible
-to answer meaningfully with 2 features. New design asks "did THIS IP behave
-maliciously over the last 60 seconds?" — answerable with ~20 behavioral features.
+Replaced per-packet ML (which was effectively a hard-coded rule) with per-flow ML
+using behavioral features aggregated over 60-second windows.
 
-### Features extracted (per `(src_ip, time_window)` flow):
+**Key features extracted per `(src_ip, time_window)` flow:**
+- **Volume:** `n_packets`, `packets_per_sec`, `total_bytes`, `avg_packet_size`, `std_packet_size`
+- **Diversity:** `unique_dst_ports`, `unique_src_ports`, `unique_protocols`, `unique_dst_ips`
+- **TCP flags:** `syn_ratio`, `syn_only_ratio` (★ key for SYN scans), `ack_ratio`, `fin_ratio`, `rst_ratio`
+- **Protocol mix:** `tcp_ratio`, `udp_ratio`, `icmp_ratio`
+- **Targeting:** `common_port_ratio`, `dst_port_std`
 
-**Volume:** `n_packets`, `packets_per_sec`, `total_bytes`, `avg_packet_size`, `std_packet_size`
+### ✅ Phase 2A — SSH connectivity to both VMs
 
-**Diversity:** `unique_dst_ports`, `unique_src_ports`, `unique_protocols`, `unique_dst_ips`
+- `src/ssh_client.py` provides `ssh_connection()` and `kali_connection()` context managers
+- Both VMs reachable from Windows host via SSH using credentials in `.env`
+- Passwordless sudo configured on both VMs for orchestrator commands
 
-**TCP flags:** `syn_ratio`, `syn_only_ratio` (★ key feature for SYN scans), `ack_ratio`, `fin_ratio`, `rst_ratio`
+### ✅ Phase 2B — Attack orchestrator + manifest format
 
-**Protocol mix:** `tcp_ratio`, `udp_ratio`, `icmp_ratio`
+- `src/attack_orchestrator.py` with `AttackOrchestrator` class
+- `get_server_time()` queries Ubuntu's clock so manifest timestamps match kern.log
+- `run()` for self-terminating attacks, `run_timed()` for floods
+- `data/attack_manifest.json` schema:
+  ```json
+  {"attack_type": "...", "attacker_ip": "...", "target_ip": "...",
+   "start_ts": "ISO8601", "end_ts": "ISO8601", "command": "...", "notes": "..."}
+  ```
 
-**Targeting:** `common_port_ratio` (hits to ports 22/80/443/etc), `dst_port_std`
+### ✅ Phase 2C — Diverse attack suite (6 types)
 
-### Current labeling — HEURISTIC (temporary, will be replaced in Phase 2)
+Each attack stresses different features so the model must learn multi-dimensional rules:
 
-A flow is labeled malicious (`1`) if ANY of:
-- `unique_dst_ports > 20` (port scan)
-- `syn_only_ratio > 0.8 AND n_packets > 10` (SYN scan/flood)
-- `packets_per_sec > 50` (flooding)
+| Attack | Tool | Stresses |
+|--------|------|----------|
+| `syn_scan` | `nmap -sS -p 1-1024` | port diversity + syn_only_ratio |
+| `fin_scan` | `nmap -sF -p 1-1024` | fin_ratio (different flag pattern) |
+| `udp_scan` | `nmap -sU --top-ports 50` | udp_ratio (different protocol) |
+| `slow_scan` | `nmap -sS -T1` (5 ports) | port diversity at low rate |
+| `syn_flood` | `hping3 --flood -S` (5s) | raw packet rate |
+| `ssh_brute` | paramiko, 50 wrong passwords | rate to single common port |
 
-**Why this is temporary:** Heuristic labels are circular for ML training. The whole
-point of Phase 2 is to replace heuristics with ground-truth labels derived from a
-manifest of attacks the user actually ran.
+**Cooldowns are 90 seconds** between attacks — empirically required to keep each
+attack in its own 60-second window. (30-second cooldowns caused window collisions.)
 
-### Phase 1 results on real data
+### ✅ Phase 2D — Benign traffic generator (6 types)
 
-After running `nmap -p 1-1000` from Kali multiple times on different days, plus
-collecting normal background traffic:
-- ~19 malicious flows correctly identified (all from `192.168.56.103`, the Kali box)
-- ~10 benign flows (DHCP from `0.0.0.0`, DNS from `10.0.2.3`, AWS from `54.154.251.197`,
-  Canonical updates from `91.189.91.157`, etc.)
-- Malicious flows show textbook nmap signature: `syn_only_ratio=1.0`, `tcp_ratio=1.0`,
-  `packets_per_sec` 10-1000, `unique_dst_ports` 200-1000+
+Generates *active* benign traffic from Windows host so the "benign" class isn't
+just background idle noise:
 
-**The two classes are highly separable in feature space — almost too separable.**
-Current dataset is monoculture (only nmap SYN scans as attacks, only background
-noise as benign). Phase 2 fixes this.
+| Traffic | Method | Contrast example |
+|---------|--------|------------------|
+| `ssh_session` | paramiko, 5 commands | vs ssh_brute (both port 22) |
+| `http_get` | raw socket, 25 GETs to nginx | vs port scans (real TCP convo) |
+| `ping_burst` | system `ping -n 20` | vs UDP/ICMP floods |
+| `file_xfer` | SFTP upload+delete (500 KB) | vs SYN flood (high TCP volume) |
+| `dns_query` | UDP probes to port 53 | vs UDP scan (legitimate UDP) |
+| `mixed` | Concurrent threaded SSH+HTTP | realistic multitasking |
+
+90-second cooldowns between each. Same `get_server_time()` used for clock consistency.
+
+### Manifest-based labeler (improved twice during Phase 2)
+
+`label_flows_from_manifest()` in `src/flow_features.py` now handles BOTH manifests:
+- Flows matching attack manifest → `label=1`, `attack_type=<type>`
+- Flows matching benign manifest → `label=0`, `attack_type='benign_active'`, `traffic_type=<type>`
+- Other flows → `label=0`, `attack_type='benign_idle'`
+
+Multi-attack windows use **greatest time-overlap wins** instead of "last wins".
+Both `all_attack_types` and `all_traffic_types` columns track all matches for debugging.
+
+### Latest dataset state (after one full Phase 2 run)
+
+- 65 total flows from one ~25-minute session
+- 10 malicious (all 6 attack types represented)
+- 9 benign-active (all 6 traffic types represented)
+- 46 benign-idle (background noise)
+
+For Phase 3, recommend running the full pipeline 2-3 more times to bulk up to
+~150-200 flows for proper train/test splits.
 
 ---
 
@@ -153,91 +221,96 @@ noise as benign). Phase 2 fixes this.
 1. **Flows over packets** — A model on per-packet features can only learn "port X is
    bad," which is a rule, not ML. Flow-level features encode behavior.
 
-2. **60-second windows** — Compromise between temporal resolution (catching short
-   attacks) and statistical significance (enough packets per flow to compute
-   meaningful ratios).
+2. **60-second windows** — Compromise between temporal resolution and statistical
+   significance. Slow_scan deliberately spans multiple windows to teach the model
+   that attacks can fragment across windows.
 
-3. **Heuristic labels are explicitly temporary** — Phase 2 replaces with manifest-based
-   ground truth. Do NOT defend or extend the heuristics; they exist only to bootstrap.
+3. **Manifest-based labeling, not heuristic** — Ground truth from "we ran this
+   attack at this time" is far more reliable than "this looks weird so probably bad".
+   Heuristics introduced false positives on legitimate high-throughput traffic.
 
-4. **Periodic retraining, NOT online learning** — User chose option (a) when offered.
-   Online learning is vulnerable to model poisoning by adaptive attackers.
+4. **Three-tier labels (malicious / benign_active / benign_idle)** — Lets us
+   evaluate the model's behavior on realistic active traffic separately from idle
+   noise. A model that correctly handles `benign_idle` but blocks `benign_active`
+   is useless in production.
 
-5. **`.env` for credentials** — Plaintext passwords in scripts were a major issue in
-   the original code. SSH key auth would be better but `.env` + python-dotenv is the
-   pragmatic upgrade for a lab.
+5. **Periodic retraining, NOT online learning** — User chose option (a). Online
+   learning is vulnerable to model poisoning by adaptive attackers.
 
-6. **`ipset` with timeouts planned for blocking** — Raw `iptables -A` permanent blocks
-   are dangerous (false positives lock out forever, `-A` can be shadowed by earlier
-   ACCEPT rules). Phase 4 will migrate to `ipset` with TTL.
+6. **`.env` for credentials** — Plaintext passwords in scripts were a major issue
+   in the original code. SSH key auth would be even better but `.env` + python-dotenv
+   is the pragmatic upgrade for a lab.
 
-7. **Anomaly detection framing planned (Phase 3)** — Real traffic is 99%+ benign;
-   binary classifiers struggle with that imbalance and can't detect novel attacks.
-   IsolationForest / OneClassSVM / autoencoder being considered.
+7. **`ipset` with timeouts planned for blocking (Phase 4)** — Raw `iptables -A`
+   permanent blocks are dangerous (false positives lock out forever, `-A` can be
+   shadowed by earlier ACCEPT rules). Phase 4 will migrate to `ipset` with TTL
+   and an allowlist for operator/localhost.
+
+8. **Anomaly detection framing planned (Phase 3)** — Real traffic is heavily skewed
+   toward benign; binary classifiers struggle and can't detect novel attacks.
+   IsolationForest / OneClassSVM / autoencoder being considered, possibly alongside
+   a supervised classifier.
+
+9. **Server-clock timestamps in manifests** — All manifest timestamps come from
+   `date -Iseconds` on Ubuntu, NOT Python's local clock, because kern.log uses
+   the server's clock. Even small clock skew between Windows and Ubuntu would
+   misalign labels.
 
 ---
 
-## 7. What's next — Phase 2 plan
+## 7. What's next — Phase 3 plan (paused, awaiting user task)
 
-**Goal:** Replace heuristic labels with ground-truth labels from a known attack manifest,
-and build a diverse, realistic dataset that doesn't suffer from monoculture.
+**Goal:** Train an actual ML model on the now-clean dataset and evaluate it properly.
 
 ### Components to build
 
-1. **`scripts/simulate_attacks.py`** — orchestrator that:
-   - Connects via SSH to BOTH Ubuntu (to clear log, collect after) AND Kali (to run attacks)
-   - Runs a sequence of varied attacks with timestamps recorded
-   - Writes `data/attack_manifest.json` with `{attack_type, attacker_ip, start_ts, end_ts}` records
+1. **`scripts/train_ai.py`** — full rewrite:
+   - Load `flows_labeled.csv`
+   - Drop non-feature columns (src_ip, window_start, attack_type, traffic_type, etc.)
+   - Stratified train/test split (preserve attack-type ratios)
+   - Train multiple models in parallel: RandomForest baseline, IsolationForest
+     anomaly detector, possibly XGBoost
+   - Evaluate with proper metrics: precision, recall, F1, confusion matrix per
+     attack type (NOT just overall accuracy — useless for imbalanced data)
+   - Save best model + a metadata JSON describing training set, version, metrics
+   - Save feature importance plots
 
-2. **`scripts/generate_benign.py`** — generates realistic benign traffic:
-   - SSH connections that complete normally
-   - HTTP requests (curl)
-   - Pings (small ICMP volumes)
-   - File transfers
-   - Windows host → Ubuntu server, so `192.168.56.1` (or whatever the host IP is) appears as a benign source
+2. **`src/model_io.py`** — load/save with versioning, schema checks (so a model
+   trained on 20 features doesn't silently fail when the feature set changes).
 
-3. **Updated `src/flow_features.py`** — add `label_flows_from_manifest(flows_df, manifest)`:
-   - For each flow, check if `(src_ip, window_start)` falls inside any manifest entry
-   - Label `1` if matched, `0` otherwise
-   - Carry attack type as metadata column for stratified analysis later
+3. **Cross-validation by attack type** — train on 5 attack types, evaluate on the
+   6th, to test generalization to unseen attacks. This is the real-world question:
+   can it catch attacks it wasn't trained on?
 
-4. **Attack types to include:**
-   - SYN scan (`nmap -sS`) — already covered
-   - FIN scan (`nmap -sF`)
-   - NULL scan (`nmap -sN`)
-   - XMAS scan (`nmap -sX`)
-   - UDP scan (`nmap -sU`)
-   - Slow scan (`nmap -T1`)
-   - Ping flood (`hping3 --flood --icmp`)
-   - SYN flood (`hping3 --flood -S`)
-   - SSH brute force attempts (hydra or simple paramiko loop)
-   - Slowloris if time permits
+4. **A "model report" output** — text + CSV summary of model performance, for
+   inclusion in PROJECT_CONTEXT updates.
 
-### Two open questions for the user (asked but not yet answered)
+### Recommended dataset prep before training
 
-1. **Can the Windows machine SSH directly into the Kali VM?** Determines whether
-   `simulate_attacks.py` can fully orchestrate from PyCharm or whether parts must
-   run on Kali manually.
-2. **Should attacks attempt to actually succeed (real password lists, real exploits)
-   or just be detected (connection attempts that get refused)?** Recommended the
-   second for cleanliness/speed; awaiting confirmation.
+- Run `simulate_attacks.py` 2-3 more times across different days
+- Run `generate_benign.py` 2-3 more times
+- Aim for ~30-50 examples per attack type, ~30-50 per benign-active type, plus
+  the natural accumulation of benign_idle flows
+- Then train
 
 ---
 
-## 8. Phase 3+ roadmap (future)
+## 8. Phase 4+ roadmap (future)
 
-- **Phase 3 — Switch to anomaly detection framing** (IsolationForest / autoencoder)
-  alongside or instead of binary classification
-- **Phase 4 — Safe blocking layer** with `ipset` timeouts, allowlist for the user's
-  own IP, confidence threshold, decision logging
+- **Phase 4 — Safe blocking layer** with `ipset` timeouts, hardcoded allowlist for
+  operator IP / 127.0.0.1 / NAT gateway, confidence threshold for blocking,
+  decision logging to file
 - **Phase 5 — Continuous learning pipeline** with periodic batch retraining and
   human-in-the-loop label confirmation
-- **Phase 6 — Reporting dashboard** (Streamlit or Flask + Chart.js): attacks over time,
-  top attacker IPs, attack type breakdown, model confidence distribution, FP review queue
+- **Phase 6 — Reporting dashboard** (Streamlit or Flask + Chart.js): attacks over
+  time, top attacker IPs, attack-type breakdown, model confidence distribution,
+  false-positive review queue
+- **Phase 7 (optional, later)** — post-compromise detection: simulating successful
+  attacks and detecting lateral movement / exfiltration patterns
 
 ---
 
-## 9. Networking concepts the user has already been taught
+## 9. Networking concepts the user has been taught
 
 (Don't re-explain unprompted; reference if needed)
 
@@ -255,6 +328,11 @@ and build a diverse, realistic dataset that doesn't suffer from monoculture.
 - Stateful vs stateless firewalls
 - Brute force, SYN flood, Slowloris, MITM, ARP spoofing concepts
 
+User has NOT yet been formally taught:
+- ML fundamentals (precision/recall, train/test, overfitting, etc.) —
+  introduce these gradually in Phase 3
+- ipset semantics — introduce in Phase 4
+
 ---
 
 ## 10. Communication style preferences
@@ -266,6 +344,9 @@ and build a diverse, realistic dataset that doesn't suffer from monoculture.
 - User catches markdown autolink artifacts in pasted code (`[parser.py](http://parser.py)`) —
   warn about these when they happen
 - User runs everything in PyCharm on Windows; terminal commands should be PowerShell-friendly
+- **The user explicitly asked to be notified when Phase 2 was complete** before
+  Claude moves to Phase 3 — they had another task to insert. Always honor explicit
+  pause requests like this.
 
 ---
 
@@ -275,22 +356,38 @@ and build a diverse, realistic dataset that doesn't suffer from monoculture.
    `parser.py` into `[parser.py](http://parser.py)` when pasted. Always warn the user
    to check pasted code for these.
 
-2. **Empty DataFrame crashes** — original `collect_data.py` crashed with `KeyError: 'label'`
-   when no flows were produced. Hardened `main()` now exits cleanly. Apply the same
-   defensive pattern in any future scripts.
+2. **Empty DataFrame crashes** — original `collect_data.py` crashed with
+   `KeyError: 'label'` when no flows were produced. Hardened `main()` exits cleanly.
+   Apply the same defensive pattern in any future scripts.
 
 3. **kern.log timestamp format is ISO 8601** on this Ubuntu version. Parser handles
    both ISO and legacy syslog formats — don't break this when refactoring.
 
-4. **The 201,520 packets in the user's first run** were not all from attacks — most
-   were legitimate internet noise via the NAT interface. Don't assume "lots of packets
-   = lots of attacks."
+4. **Background internet noise** in logs (Canonical update servers, AWS, CDNs) —
+   most flows are this, not attacks. Don't assume "lots of packets = lots of attacks."
 
 5. **`break` after first detection in old `ai_agent_live.py`** killed the agent
-   permanently. The Phase 4 rewrite must NOT do this — just block-and-continue.
+   permanently. Phase 4 rewrite must NOT do this — block-and-continue, never exit.
 
 6. **`iptables -A` vs `-I`** — append vs insert at top. Blocking rules should always
    use `-I INPUT 1` to avoid being shadowed by earlier ACCEPT rules.
+
+7. **Localhost (127.0.0.1) and operator IP (192.168.56.1) and NAT gateway (10.0.2.x)
+   MUST be on a permanent allowlist in Phase 4** — they appear in logs and can
+   trigger high-rate heuristics, but blocking them would break the server / lock
+   the user out / kill VirtualBox networking.
+
+8. **Cooldowns between orchestrated sessions must be ≥90s** — shorter cooldowns
+   cause attack/benign sessions to share 60-second windows and confuse labeling.
+
+9. **`hping3 --flood` and `nmap -sS` require root on Kali** — passwordless sudo
+   is configured for these specific binaries only. Don't add new attack tools
+   without updating `/etc/sudoers` on Kali.
+
+10. **Ubuntu nginx is now running** — port 80 will accept connections. Future
+    "port scan" attacks will see port 80 as OPEN (not closed), which produces
+    different responses than scanning closed ports. Worth testing if attack
+    fingerprints shift.
 
 ---
 
@@ -304,12 +401,11 @@ Start the new chat with something like:
 >
 > [paste contents of PROJECT_CONTEXT.md]
 
-Then in your second message, tell the new Claude exactly what you want to do next
-(e.g. "Let's start Phase 2" or "I'm hitting a bug in collect_data.py, here's the
-error..."). If the work involves code, also paste the current contents of any
-relevant scripts and a few sample rows from `flows.csv`.
+Then in your second message, tell the new Claude exactly what you want to do next.
+If the work involves code, also paste the current contents of any relevant scripts
+and a few sample rows from `flows_labeled.csv`.
 
 ---
 
-*Last updated: end of Phase 1, before Phase 2 kickoff.*
+*Last updated: end of Phase 2D. Phase 3 paused at user's request.*
 *Update this file at the end of each phase or major milestone.*
