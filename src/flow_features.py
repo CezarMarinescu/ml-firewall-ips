@@ -139,26 +139,34 @@ def label_flows_heuristic(flows_df: pd.DataFrame) -> pd.DataFrame:
     df["label"] = (is_port_scan | is_syn_scan | is_flood).astype(int)
     return df
 
-def label_flows_from_manifest(flows_df: pd.DataFrame, manifest_path,
+def label_flows_from_manifest(flows_df: pd.DataFrame,
+                              attack_manifest_path,
+                              benign_manifest_path=None,
                               buffer_seconds: int = 5,
                               window_seconds: int = 60) -> pd.DataFrame:
     """
-    Label flows using ground-truth attack manifest instead of heuristics.
+    Label flows using ground-truth manifests instead of heuristics.
 
-    A flow is labeled malicious (1) if its (src_ip, time_window) overlaps
-    with any attack in the manifest (with buffer_seconds of slack).
+    A flow is labeled malicious (1) if it overlaps with an attack manifest
+    entry whose attacker_ip matches.
 
-    When multiple attacks touch the same window, we pick the one with the
-    GREATEST time-overlap as the primary attack_type, and record all
-    matching attack types in `all_attack_types` (semicolon-separated).
-    This prevents silently dropping attacks when cooldowns are too short
-    to cleanly separate them.
+    A flow is given an explicit benign label and traffic_type when it
+    overlaps with a benign manifest entry — these are KNOWN-good active
+    sessions (SSH, HTTP, file transfer, etc).
 
-    Adds three new columns:
-      - label (0/1)
-      - attack_type    : primary (most-overlap) attack type, or "benign"
-      - all_attack_types : semicolon-separated list of every attack
-                           that touched this window (for debugging)
+    Flows that match neither manifest stay as label=0 / attack_type='benign_idle'.
+
+    When multiple entries touch the same window, the one with greatest
+    time-overlap wins. All matches are recorded in `all_attack_types`
+    (or `all_traffic_types` for benign) for debugging.
+
+    Adds columns:
+      - label             : 0 or 1
+      - attack_type       : primary attack type, or 'benign_active' / 'benign_idle'
+      - traffic_type      : for benign-active flows, the specific kind
+                            (ssh_session, http_get, ping_burst, file_xfer, dns_query, mixed)
+      - all_attack_types  : ;-separated list of overlapping attacks
+      - all_traffic_types : ;-separated list of overlapping benign sessions
     """
     import json
     from datetime import datetime, timedelta
@@ -166,50 +174,79 @@ def label_flows_from_manifest(flows_df: pd.DataFrame, manifest_path,
     if flows_df.empty:
         return flows_df
 
-    with open(manifest_path) as f:
-        records = json.load(f)
+    # Load attack manifest (required)
+    with open(attack_manifest_path) as f:
+        attack_records = json.load(f)
+
+    # Load benign manifest (optional — Phase 2D adds this)
+    benign_records = []
+    if benign_manifest_path is not None:
+        try:
+            with open(benign_manifest_path) as f:
+                benign_records = json.load(f)
+        except FileNotFoundError:
+            pass  # benign manifest not yet generated — that's OK
 
     df = flows_df.copy()
     df["window_start"] = pd.to_datetime(df["window_start"])
     df["window_end"]   = df["window_start"] + pd.Timedelta(seconds=window_seconds)
 
     df["label"] = 0
-    df["attack_type"] = "benign"
+    df["attack_type"] = "benign_idle"
+    df["traffic_type"] = ""
     df["all_attack_types"] = ""
+    df["all_traffic_types"] = ""
 
-    # Pre-parse manifest into datetimes once
-    parsed_records = []
-    for rec in records:
-        parsed_records.append({
-            "atype":     rec["attack_type"],
-            "attacker":  rec["attacker_ip"],
-            "atk_start": datetime.fromisoformat(rec["start_ts"]) - timedelta(seconds=buffer_seconds),
-            "atk_end":   datetime.fromisoformat(rec["end_ts"])   + timedelta(seconds=buffer_seconds),
-        })
+    def _parse_records(records, type_field):
+        parsed = []
+        for rec in records:
+            parsed.append({
+                "type":     rec[type_field],
+                "src_ip":   rec.get("attacker_ip") or rec.get("source_ip"),
+                "ts_start": datetime.fromisoformat(rec["start_ts"]) - timedelta(seconds=buffer_seconds),
+                "ts_end":   datetime.fromisoformat(rec["end_ts"])   + timedelta(seconds=buffer_seconds),
+            })
+        return parsed
 
-    # For each row, find ALL matching attacks and pick the one with greatest overlap
+    parsed_attacks = _parse_records(attack_records, "attack_type")
+    parsed_benign  = _parse_records(benign_records, "traffic_type")
+
     for idx, row in df.iterrows():
         win_start = row["window_start"]
         win_end   = row["window_end"]
         src_ip    = row["src_ip"]
 
-        matches = []  # list of (attack_type, overlap_seconds)
-        for rec in parsed_records:
-            if rec["attacker"] != src_ip:
+        # Find all overlapping attacks
+        attack_matches = []
+        for rec in parsed_attacks:
+            if rec["src_ip"] != src_ip:
                 continue
-            # Compute time-overlap between flow window and attack window
-            overlap_start = max(win_start, rec["atk_start"])
-            overlap_end   = min(win_end,   rec["atk_end"])
-            overlap = (overlap_end - overlap_start).total_seconds()
+            overlap = (min(win_end, rec["ts_end"]) - max(win_start, rec["ts_start"])).total_seconds()
             if overlap > 0:
-                matches.append((rec["atype"], overlap))
+                attack_matches.append((rec["type"], overlap))
 
-        if matches:
-            # Sort by overlap descending; pick first as primary
-            matches.sort(key=lambda x: x[1], reverse=True)
+        # Find all overlapping benign-active sessions
+        benign_matches = []
+        for rec in parsed_benign:
+            if rec["src_ip"] != src_ip:
+                continue
+            overlap = (min(win_end, rec["ts_end"]) - max(win_start, rec["ts_start"])).total_seconds()
+            if overlap > 0:
+                benign_matches.append((rec["type"], overlap))
+
+        if attack_matches:
+            attack_matches.sort(key=lambda x: x[1], reverse=True)
             df.at[idx, "label"] = 1
-            df.at[idx, "attack_type"] = matches[0][0]
-            df.at[idx, "all_attack_types"] = ";".join(m[0] for m in matches)
+            df.at[idx, "attack_type"] = attack_matches[0][0]
+            df.at[idx, "all_attack_types"] = ";".join(m[0] for m in attack_matches)
+
+        if benign_matches:
+            benign_matches.sort(key=lambda x: x[1], reverse=True)
+            df.at[idx, "traffic_type"] = benign_matches[0][0]
+            df.at[idx, "all_traffic_types"] = ";".join(m[0] for m in benign_matches)
+            # If not also flagged malicious, mark as benign_active
+            if not attack_matches:
+                df.at[idx, "attack_type"] = "benign_active"
 
     df = df.drop(columns=["window_end"])
     return df
