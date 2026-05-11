@@ -1,0 +1,42 @@
+{
+  "model_type": "RandomForestClassifier",
+  "feature_columns": [
+    "n_packets",
+    "packets_per_sec",
+    "total_bytes",
+    "avg_packet_size",
+    "std_packet_size",
+    "unique_dst_ports",
+    "unique_src_ports",
+    "unique_protocols",
+    "unique_dst_ips",
+    "syn_ratio",
+    "syn_only_ratio",
+    "ack_ratio",
+    "fin_ratio",
+    "rst_ratio",
+    "tcp_ratio",
+    "udp_ratio",
+    "icmp_ratio",
+    "common_port_ratio",
+    "dst_port_std"
+  ],
+  "label_classes": [
+    "benign",
+    "malicious"
+  ],
+  "training_set_size": 137,
+  "training_timestamp": "2026-05-11T21:16:35.953022",
+  "metrics": {
+    "benign": {
+      "precision": 0.9629629629629629,
+      "recall": 0.9285714285714286,
+      "f1": 0.9454545454545454
+    },
+    "malicious": {
+      "precision": 0.75,
+      "recall": 0.8571428571428571,
+      "f1": 0.8
+    }
+  }
+}
