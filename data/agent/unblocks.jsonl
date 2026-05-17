@@ -1,0 +1,3 @@
+{"logged_at": "2026-05-17T08:28:39.330918+00:00", "action": "remove_one", "removed": ["192.0.2.1"], "count": 1, "reason": "smoke test cleanup"}
+{"logged_at": "2026-05-17T08:30:46.137520+00:00", "action": "flush", "removed": ["192.0.2.1", "192.0.2.2"], "count": 2, "reason": ""}
+{"logged_at": "2026-05-17T08:31:28.484053+00:00", "action": "flush", "removed": ["192.0.2.1"], "count": 1, "reason": "automated test"}
