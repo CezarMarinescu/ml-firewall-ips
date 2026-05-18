@@ -55,6 +55,10 @@ update servers, AWS, CDNs) mixed with lab traffic. Useful as benign baseline noi
 services chatter on loopback. The decision engine's allowlist excludes 127.0.0.1,
 the operator IP, and the NAT gateway from ever being blocked.
 
+**Internal IP `192.168.56.100`:** appears in flows as single-packet UDP-576
+broadcasts. Likely Windows NetBIOS/mDNS background chatter. Labeled `benign_idle`
+when it shows up in review queues.
+
 ---
 
 ## 3. Current project structure
@@ -67,11 +71,22 @@ AI_IDS_Project/
 │   ├── flows_labeled.csv           # Flows with manifest-based labels (172 rows)
 │   ├── attack_manifest.json        # Ground-truth attack timestamps
 │   ├── benign_manifest.json        # Ground-truth benign-active session timestamps
-│   └── models/
-│       ├── rf_baseline.pkl         # Trained RandomForest classifier
-│       ├── rf_baseline.json        # RF metadata + metrics
-│       ├── iforest_baseline.pkl    # Trained IsolationForest anomaly detector
-│       └── iforest_baseline.json   # IF metadata + metrics
+│   ├── models/
+│   │   ├── rf_baseline.pkl         # Current production RF
+│   │   ├── rf_baseline.json        # RF metadata + metrics
+│   │   ├── iforest_baseline.pkl    # Current production IF
+│   │   ├── iforest_baseline.json   # IF metadata + metrics
+│   │   ├── rf_v1.pkl               # Archived old version (created on --commit)
+│   │   └── iforest_v1.pkl          # Archived old version
+│   ├── agent/                      # Created by run_agent on first run
+│   │   ├── decisions.jsonl         # Full audit log of every decision
+│   │   ├── watch.jsonl             # WATCH-only subset for easy review
+│   │   └── unblocks.jsonl          # Audit of every kill-switch action
+│   └── review/                     # Phase 5 working area
+│       ├── review_queue.csv        # Volatile workspace for current labeling session
+│       ├── review_queue.meta.json  # Stats about the current queue
+│       ├── review_queue.backup_*.csv  # Auto-backups before each labeling session
+│       └── flows_reviewed.csv      # CUMULATIVE archive of all finalized labels
 ├── scripts/
 │   ├── __init__.py
 │   ├── collect_data.py             # Batch: SSH to server, parse logs, build flows
@@ -82,7 +97,14 @@ AI_IDS_Project/
 │   ├── train_ai.py                 # Phase 3B — train RandomForest classifier
 │   ├── train_anomaly.py            # Phase 3C — train IsolationForest
 │   ├── test_decision_engine.py     # Phase 4B — validate decision logic on flows.csv
-│   └── test_live_tailer.py         # Phase 4C — smoke test the real-time log tailer
+│   ├── test_live_tailer.py         # Phase 4C — smoke test the real-time log tailer
+│   ├── test_block_executor.py      # Phase 4D — validate the block executor
+│   ├── run_agent.py                # Phase 4E — main live agent
+│   ├── unblock_all.py              # Phase 4F — kill switch / unblock utility
+│   ├── build_review_queue.py       # Phase 5A.1 — build review queue (skips finalized)
+│   ├── review_queue.py             # Phase 5B — interactive CLI review tool
+│   ├── finalize_reviews.py         # Phase 5B.5 — move labels into cumulative archive
+│   └── retrain.py                  # Phase 5C/5D — retrain with strict gate + commit
 ├── src/
 │   ├── __init__.py
 │   ├── fw_parser.py                # Parse FW_LOG lines (ISO 8601 + legacy formats)
@@ -91,6 +113,7 @@ AI_IDS_Project/
 │   ├── ssh_client.py               # ssh_connection() + kali_connection() managers
 │   ├── model_io.py                 # Model save/load with feature schema check
 │   ├── decision_engine.py          # Phase 4B — Decision dataclass + DecisionEngine
+│   ├── block_executor.py           # Phase 4D — safety-wrapped ipset blocker (5A.0: logs full flow)
 │   └── live_tailer.py              # Phase 4C — live SSH tail + flow rolling
 ├── .env                            # SECRETS — gitignored
 ├── .env.example                    # Sanitized template (in repo)
@@ -102,10 +125,8 @@ AI_IDS_Project/
 ```
 
 **Files NOT yet created (planned):**
-- `src/block_executor.py` — Phase 4D, the safety-wrapped ipset block applier
-- `scripts/run_agent.py` — Phase 4E, the main live agent wiring everything together
-- `scripts/unblock_all.py` — Phase 4F, kill-switch utility
-- Reporting/dashboard layer — Phase 6
+- `scripts/run_cycle.py` — Phase 5E, orchestration wrapper for 5A→5B→5B.5→5C
+- Reporting/dashboard layer — Phase 6 (likely Streamlit)
 
 ---
 
@@ -167,210 +188,161 @@ behavioral features aggregated over 60-second windows.
 
 ### ✅ Phase 2 — Ground-truth data generation
 
-**2A/B:** SSH connectivity to both VMs + AttackOrchestrator with server-clock timing.
-Manifest schema:
-```json
-{"attack_type": "...", "attacker_ip": "...", "target_ip": "...",
- "start_ts": "ISO8601", "end_ts": "ISO8601", "command": "...", "notes": "..."}
-```
-
-**2C — 6 attack types** (each stresses different features):
-- `syn_scan` (nmap -sS, 1-1024) — port diversity + syn_only_ratio
-- `fin_scan` (nmap -sF, 1-1024) — fin_ratio
-- `udp_scan` (nmap -sU, top 50) — udp_ratio
-- `slow_scan` (nmap -sS -T1, 5 ports) — port diversity at low rate
-- `syn_flood` (hping3 --flood -S, 5s) — raw packet rate
-- `ssh_brute` (paramiko, 50 wrong pw) — single-port high-rate auth attempts
-
-**Cooldowns: 90 seconds** between attacks (30s caused window collisions).
-
-**2D — 6 benign-active traffic types** from operator host:
-- `ssh_session`, `http_get`, `ping_burst`, `file_xfer`, `dns_query`, `mixed`
-
-Same 90s cooldowns. Same `get_server_time()` for clock consistency.
-
-**Three-tier labeling** in `label_flows_from_manifest()`:
-- `label=1, attack_type=<type>` — matches attack manifest
-- `label=0, attack_type='benign_active', traffic_type=<type>` — matches benign manifest
-- `label=0, attack_type='benign_idle'` — uncontrolled background
-
-Multi-overlap windows: greatest-temporal-overlap wins. `all_attack_types` and
-`all_traffic_types` columns retain full list for debugging.
+(See previous version of this document; unchanged.)
 
 ### ✅ Phase 3 — Model training and evaluation
 
-**Current dataset:** 172 flows total. After 3 full attack+benign cycles:
-- 33 malicious (across all 6 attack types)
-- 21 benign-active (across all 6 traffic types)
-- 118 benign-idle (background noise)
+172 flows total, 33 malicious / 139 benign. 80/20 split with `random_state=42`
+(important — Phase 5C reuses this seed to recreate the same test set).
 
-**3B — RandomForest classifier (`rf_baseline`):**
-- 80/20 stratified split, class_weight='balanced', n_estimators=200, max_depth=10
-- **Test results:**
-  - Benign: precision=0.963, recall=0.929, F1=0.945
-  - Malicious: precision=0.750, recall=0.857, **F1=0.800**
-- Top features: avg_packet_size, n_packets, syn_ratio, total_bytes, unique_src_ports
-- Schema-versioned via `src/model_io.py`
-
-**3C — IsolationForest anomaly detector (`iforest_baseline`):**
-- Trained on benign flows only (139 rows), n_estimators=300, contamination='auto'
-- **Test results:**
-  - Malicious: precision=0.590, recall=0.697, F1=0.639
-  - **ROC-AUC=0.863**
-- Threshold sweep recorded for Phase 4 calibration (80th percentile sweet spot)
-- Catches attacks the supervised model never saw — complementary
+**RF baseline:** P=0.75, R=0.857, F1=0.80 (malicious)
+**IF baseline:** F1=0.639 (malicious), ROC-AUC=0.863
 
 ### ✅ Phase 4A — Blocking infrastructure
+### ✅ Phase 4B — Decision engine
+### ✅ Phase 4C — Live tailer
+### ✅ Phase 4D — Block executor (Phase 5A.0 update: also logs full flow features to JSONL)
+### ✅ Phase 4E — Live agent (`run_agent.py`)
 
-ipset + iptables setup on Ubuntu (see Section 4). Persisted via netfilter-persistent.
-Smoke-tested: add/remove IPs from `ml_blocks` works, timeout decrements correctly.
+End-to-end validated. SYN scan detection works at `--rf-threshold 0.80`:
+RF=0.83, IF=anomalous → DRY_RUN_BLOCK. Allowlist correctly protects operator IP.
 
-### ✅ Phase 4B — Decision engine (`src/decision_engine.py`)
+### ✅ Phase 4F — Kill switch (`unblock_all.py`)
 
-Pure Python, no side effects. Takes a flow dict, returns a structured `Decision`.
+Three modes: `--list`, `--ip <addr>`, full flush. Audit log at `data/agent/unblocks.jsonl`.
 
-**Six-layer safety design:**
-1. Hardcoded allowlist (operator IP, 127.0.0.1, NAT gateway) — checked BEFORE models
-2. RF confidence threshold (default 0.85)
-3. Conservative combining policy
-4. Time-limited blocks (1h via ipset timeout) — Phase 4A
-5. Rate limit (planned in 4D)
-6. DRY-RUN mode (planned in 4E)
+### ✅ Phase 5A.0 — Block executor patched to log full feature vector
 
-**Verdict policy:**
-- `ALLOW` — RF benign AND IF normal
-- `WATCH` — one model fires but not both at high confidence (logged, no firewall action)
-- `BLOCK` — RF malicious with prob ≥ threshold AND IF anomalous
+`handle()` accepts optional `flow=` parameter; when provided, the full 19-feature
+dict is written to `decisions.jsonl` under a `"flow"` key. Backward compatible
+with old test code that doesn't pass it.
 
-**Decision object** carries: verdict, RF prob, IF score, allowlist flag, human-readable
-reason, top contributing features (for audit log explainability).
+### ✅ Phase 5A.1 — Review queue builder (`build_review_queue.py`)
 
-**Validation on 172 historical flows:**
-- 131 ALLOW, 32 WATCH, 9 BLOCK
-- True positive blocks: 8/33 malicious
-- False positive blocks: 1/139 benign (a Canonical/AWS-style high-throughput flow)
-- 80 operator IP flows: 100% ALLOW (allowlist verified)
+Reads `decisions.jsonl`, samples ALLOWs (5% with near-miss boost), keeps all
+BLOCKs and WATCHes, groups consecutive same-IP BLOCKs as incidents, writes
+`data/review/review_queue.csv`. **Skips already-finalized rows** (matches on
+`(src_ip, window_start)` against `flows_reviewed.csv`) so subsequent rebuilds
+only show new work.
 
-### ✅ Phase 4C — Live tailer (`src/live_tailer.py`)
+### ✅ Phase 5B — Interactive review CLI (`review_queue.py`)
 
-Real-time SSH log streaming. Converts packet stream → flow stream with no side effects.
+Walks user through each row, prompts `[a]ttack / [b]enign / [s]kip / [u]nsure`,
+with attack-type and benign-type submenus. Auto-saves after every label,
+timestamped backup at session start, resumable.
 
-**Mechanism:**
-- `sudo tail -F -n 0 /var/log/kern.log` over SSH (only new packets, not history)
-- Per-IP buffer of packets keyed by 60s window
-- Watermark = most recent packet timestamp (uses server clock, not local)
-- Window closes when watermark > window_start + 60s + 10s grace
-- Closed window → compute features via `_compute_flow_features` (same code as batch)
-- Emit flow via callback; consumer decides what to do with it
+### ✅ Phase 5B.5 — Finalize reviews (`finalize_reviews.py`)
 
-**Reliability:**
-- SSH disconnect → exponential backoff reconnect, state preserved
-- Parse errors → silently skip (one bad line doesn't kill the agent)
-- Callback errors → logged, agent continues
-- Ctrl-C → graceful stop via threading.Event
+Moves rows with `needs_review=done` and binary `reviewed_label` from
+`review_queue.csv` into the cumulative `flows_reviewed.csv` archive.
+Deduplicates by `(src_ip, window_start)` keeping the latest label,
+so re-labeling a row and re-finalizing corrects mistakes.
 
-**Smoke-test results (real run):**
-- 8,409 packets parsed
-- 0 packets dropped
-- 10 flows emitted across multiple source IPs
-- 0 SSH reconnects (stable)
-- Detected nmap -sS attack from Kali in real time: `syn_only=0.98, ports=100, tcp=1.00`
+### ✅ Phase 5C — Retraining pipeline (`retrain.py`)
+
+Combines `flows_labeled.csv` (137 train rows from the original split) with
+`flows_reviewed.csv` (currently 25 reviewed rows), trains new RF + IF with
+identical hyperparameters, evaluates BOTH old and new models on the SAME
+35-row frozen test set, applies strict gate.
+
+**Strict gate policy:** new wins iff Δprecision ≥ 0 AND Δrecall ≥ 0 on the
+malicious class, for BOTH models. One regression fails all. `--commit` does
+the swap; default is dry-run.
+
+### ✅ Phase 5D — Versioning & rollback
+
+Baked into `retrain.py --commit`. On commit, archives existing baseline as
+`rf_v1.pkl` / `iforest_v1.pkl` (auto-incremented), then overwrites baseline
+with new model. Rollback is `cp data/models/rf_v1.pkl data/models/rf_baseline.pkl`.
+
+### 📌 Phase 5C empirical finding (worth documenting in dissertation)
+
+First two retraining attempts (12 reviewed rows, then 25) were both **rejected**
+by the strict gate. The malicious-precision metric on the 35-row frozen test
+set regressed by 0.0833 in both cases (one extra false positive in 9 predicted
+malicious flows). Adding more reviewed data did NOT change the numbers.
+
+Root cause is probably test-set granularity: with only 7 malicious examples
+in the held-out test set, precision quantizes in chunks of ~0.11, so the
+strict gate is too sensitive to single-example flips. This is the gate doing
+its job (refusing marginal improvements) but suggests that for production use,
+either a larger held-out test set or a less brittle metric would be needed.
+
+The **system is working as designed**; this is a methodological finding, not
+a bug. SSH brute force WAS confirmed as a false negative (RF=0.38 in first run,
+RF=0.51 in second — model has learned the signature is suspicious but not
+crossed the threshold).
 
 ---
 
 ## 6. Key technical decisions made (and why)
 
-1. **Flows over packets** — per-packet ML degenerates into hardcoded port rules.
-2. **60-second windows** — balance between temporal resolution and statistical sample size.
-3. **Manifest-based labeling, not heuristic** — ground truth from "we ran this attack
-   at this time" avoids the circularity of heuristic-then-train-on-heuristic.
-4. **Three-tier labels** — separating benign-active from benign-idle exposes the
-   "blocks legitimate users" failure mode that binary metrics hide.
-5. **Periodic retraining, NOT online learning** — online is vulnerable to poisoning.
-6. **`.env` for credentials, gitignored** — repo is public.
-7. **`ipset` with timeouts, not raw iptables** — O(1) blocking, auto-expiry,
-   protects against permanent false positives.
-8. **Server-clock timestamps in manifests AND live watermark** — kern.log is in
-   server time; using local time would misalign labels.
-9. **Two models (supervised RF + unsupervised IF)** — RF for known attacks,
-   IF for novelty. Conservative combining: block only when both agree.
-10. **Allowlist checked BEFORE model inference** — defense in depth. Even if models
-    catastrophically misbehave, allowlisted IPs are mathematically un-blockable.
-11. **Live tailer reads but doesn't act** — strict separation of concerns. Phase 4D
-    adds the executor; this module remains side-effect-free.
+(Unchanged from previous version, plus:)
+
+12. **Volatile queue vs cumulative archive (Phase 5).** `review_queue.csv` is
+    rebuilt fresh on every `build_review_queue` run. `flows_reviewed.csv` is
+    the append-only archive of all labels ever applied. `retrain.py` reads
+    from the archive, not the queue. This separation means rebuilds never
+    destroy labeling work, and retraining always sees the complete label set.
+
+13. **Strict gate, even when it fails.** With small test sets the gate may
+    reject improvements indistinguishable from noise. We did not relax the
+    gate when it rejected — that would defeat the purpose. Documented as a
+    finding instead. Gate logic: per-model, malicious-class Δprecision ≥ 0
+    AND Δrecall ≥ 0, with both models required to pass for swap to proceed.
+
+14. **`random_state=42` reused EVERYWHERE.** The retrain pipeline depends on
+    being able to recreate the EXACT original 80/20 test set from
+    `flows_labeled.csv`. Both `train_ai.py` and `retrain.py` pass
+    `random_state=42, test_size=0.2, stratify=y` to `train_test_split`,
+    which deterministically reproduces the same partition.
 
 ---
 
-## 7. What's next — Phase 4D plan (immediate next step)
+## 7. What's next — Phase 5E plan (immediate next step)
 
-**Goal:** Build `src/block_executor.py` — the careful module that actually touches
-the firewall. Most safety-critical component in the system.
+**Goal:** Build `scripts/run_cycle.py` — orchestration wrapper that runs
+the full retraining cycle with one command.
 
-**Components:**
+**Steps it would run:**
+1. `build_review_queue` (rebuild queue from latest decisions.jsonl)
+2. Prompt the user: "N rows to review — start now? [y/n]"
+3. If yes: run `review_queue --skip-allowlist` interactively
+4. `finalize_reviews` (move labels into archive)
+5. `retrain` (dry-run by default)
+6. Prompt the user: "Verdict was ACCEPT/REJECT. Commit? [y/n]"
+7. If accepted and confirmed: `retrain --commit`
 
-1. `BlockExecutor` class that takes a `Decision` and applies action accordingly:
-   - `ALLOW` → log to decisions log, do nothing
-   - `WATCH` → log to a separate watch log for review
-   - `BLOCK` → double-check allowlist (paranoid, don't trust upstream),
-     check rate limit, SSH to Ubuntu, `sudo ipset add ml_blocks <ip>`, log decision
-2. **DRY-RUN mode** as default — every BLOCK is logged with `[DRY-RUN]` prefix
-   but no ipset action occurs. Only flips to real mode when explicitly enabled.
-3. **Rate limit** — max N blocks per minute (default 5). Prevents runaway blocking.
-4. **Decision log** — JSONL file at `data/agent/decisions.jsonl`, one line per decision,
-   full audit trail.
-5. **Already-blocked tracking** — don't re-issue ipset add for IPs that are still
-   timing out (idempotent).
-
-After 4D, **Phase 4E** wires LiveTailer + DecisionEngine + BlockExecutor into a
-single runnable `scripts/run_agent.py`. Test thoroughly in DRY-RUN before enabling
-real blocking.
-
-**Phase 4F** is the kill switch — `scripts/unblock_all.py` to instantly flush
-`ml_blocks` if anything goes wrong.
+It's a UX wrapper. Each step already works individually. Estimated 1 hour.
 
 ---
 
-## 8. Phase 5+ roadmap (future)
+## 8. Phase 6+ roadmap (future)
 
-- **Phase 5 — Continuous learning pipeline** with periodic batch retraining and
-  human-in-the-loop label confirmation. Reads decisions.jsonl + new manifests,
-  retrains, archives old model versions.
-- **Phase 6 — Reporting dashboard** (Streamlit or Flask): attacks over time,
-  top attacker IPs, attack-type breakdown, confidence distribution, FP review queue.
+- **Phase 5E** — Orchestration wrapper (see above)
+- **Phase 5.5 — Real armed-mode validation** — never tested `run_agent --arm`
+  in real operation. Need a careful test plan: start agent armed, trigger one
+  SYN scan, verify Kali actually gets blocked in ipset, verify allowlist still
+  protects operator IP, manually unblock via kill switch, repeat.
+- **Phase 6 — Reporting dashboard** (Streamlit): attacks over time, top attacker
+  IPs, attack-type breakdown, confidence distribution, FP review queue browser.
 - **Phase 7 (optional, advanced)** — post-compromise detection: simulating
   successful attacks and detecting lateral movement / exfiltration patterns.
+- **Documentation pass** — update README, write up Phase 5 finding properly
+  for dissertation results section.
 
 ---
 
-## 9. Networking concepts the user has been taught
+## 9. Networking & ML concepts the user has been taught
 
-(Don't re-explain unprompted; reference if needed)
+(Unchanged. See previous version. New additions:)
 
-- OSI/TCP-IP layer model basics
-- Public vs private IP ranges, NAT mechanics
-- Why VirtualBox VMs have two IPs (NAT + Host-Only)
-- TCP vs UDP differences; TCP three-way handshake
-- TCP flags: SYN, ACK, FIN, RST, PSH, URG
-- Why SYN scans are detectable (`syn_only_ratio = 1.0`)
-- Variant scan types (FIN, NULL, XMAS, ACK)
-- Common ports cheat sheet
-- iptables chains (INPUT/OUTPUT/FORWARD), targets (ACCEPT/DROP/REJECT/LOG)
-- Stateful vs stateless firewalls
-- ipset semantics (Phase 4A) — hash:ip with timeouts, single iptables rule references the set
-- Brute force, SYN flood, Slowloris, MITM, ARP spoofing concepts
-
-**ML concepts the user has been taught:**
-- Train/test split, why it matters
-- Why accuracy is misleading on imbalanced data
-- Precision, recall, F1, confusion matrix
-- Stratified split (preserving class proportions)
-- class_weight='balanced'
-- Random Forest intuition (many trees, majority vote)
-- Feature importance (and its limits — global, not per-prediction)
-- Isolation Forest intuition (anomalies are easy to isolate)
-- ROC curve and AUC (threshold-independent quality metric)
-- Threshold sweep / operating point selection
-- Contamination parameter and why its default of 0.01 was wrong for our data
+- Continuous learning vs online learning (we chose periodic batch with HITL,
+  not online — online is vulnerable to poisoning)
+- Train/eval split reproducibility via `random_state`
+- Strict gates vs loose gates in model deployment
+- Test-set granularity effects (small test set = quantized metrics)
+- Difference between volatile workspace and immutable archive in data pipelines
 
 ---
 
@@ -384,6 +356,8 @@ real blocking.
 - User runs everything in PyCharm on Windows; commands should be PowerShell-friendly
 - **User explicitly asked to be notified at phase boundaries** before moving forward.
   Honor explicit pause requests.
+- **User asked for clear "Commands to run" sections at the END of each response**
+  — separate from explanation/discussion. Never bury commands inside narrative.
 - User has a separate dissertation paper task — IEEE 2-column LaTeX format.
   First draft delivered with intentional methodology-focused framing, results
   section reserved for May 31 (when models are trained — now done).
@@ -393,53 +367,30 @@ real blocking.
 
 ## 11. Things to watch out for
 
+(Unchanged items omitted; new and updated:)
+
 1. **Markdown autolink leakage** in pasted code — warn about these.
 
-2. **Empty DataFrame crashes** — original `collect_data.py` had a `KeyError: 'label'`
-   bug. Hardened. Apply same defensive pattern in future scripts.
+12. **Pasting commands at interactive prompts.** User has pasted bash commands
+    into `review_queue.py`'s `[a]/[b]/[s]/...` prompt by accident. The tool
+    correctly refuses and re-prompts. Warn the user that verification commands
+    are for AFTER labeling, not during.
 
-3. **kern.log timestamp format is ISO 8601** on this Ubuntu version. Parser handles
-   both ISO and legacy syslog formats. Don't break this when refactoring.
+13. **Empty file from copy-paste mishap.** When asking the user to save a
+    long file, the file may end up at 0 bytes if PyCharm autosaves before
+    paste completes. If a script "does nothing" silently, first check
+    `dir <file>` to confirm Length is non-zero.
 
-4. **Background internet noise** dominates raw log volume. Most flows are this,
-   not attacks. "High packet count" alone is NOT a strong attack signal.
+14. **flows_reviewed.csv must have `window_start` filled in.** The skip-
+    finalized logic in `build_review_queue.py` matches on
+    `(src_ip, window_start)`. If a row has empty window_start, dedup fails
+    silently and the user re-reviews finalized rows. `finalize_reviews.py`
+    inherits whatever was in `review_queue.csv`, and `build_review_queue.py`
+    always populates window_start, so this should be safe in normal flow.
 
-5. **Old `ai_agent_live.py`** (deleted) had `break` after first detection — killed
-   the agent permanently. Phase 4E rewrite must NOT do this. Block-and-continue.
-
-6. **`iptables -A` vs `-I`** — append vs insert at top. Use `-I INPUT 1` for blocking
-   rules to avoid being shadowed by earlier ACCEPT rules.
-
-7. **Allowlist is sacred.** 127.0.0.1, operator IP (192.168.56.1), NAT gateway
-   (10.0.2.x) MUST never be blocked. Allowlist check happens BEFORE model inference.
-
-8. **Cooldowns between orchestrated sessions ≥90s** — shorter caused window collisions
-   in Phase 2C.
-
-9. **Hping3 floods and nmap SYN scans require root on Kali** — passwordless sudo
-   configured for specific binaries only. Don't add new attack tools without
-   updating `/etc/sudoers` on Kali.
-
-10. **Duplicate LOG rules bug recurred twice** in this project. Root cause: running
-    `iptables -A INPUT -j LOG ...` without first flushing or checking for existing
-    rule. Phase 4E setup script should use idempotent pattern:
-    ```bash
-    sudo iptables -C INPUT -j LOG --log-prefix "FW_LOG: " 2>/dev/null || \
-      sudo iptables -A INPUT -j LOG --log-prefix "FW_LOG: "
-    ```
-    Symptom: kern.log packet counts inflated 2x. Always verify with
-    `sudo iptables -L INPUT -n -v --line-numbers` after firewall changes.
-
-11. **VM reboot considerations:**
-    - iptables rules: persisted via netfilter-persistent
-    - ipset: persisted via ipset-persistent (but as empty set — entries don't survive)
-    - sudoers: persisted (kernel-independent)
-    - Kali SSH server: enabled, starts on boot
-    After reboot, verify `sudo iptables -L INPUT -n` shows exactly DROP+LOG before
-    running anything that depends on logging.
-
-12. **PowerShell `curl` is actually `Invoke-WebRequest`** — heavier than expected.
-    Use `curl.exe` for Unix-style curl, or `Invoke-WebRequest -UseBasicParsing`.
+15. **Strict gate rejections are normal.** Don't relax the gate or force-commit
+    when it rejects. Either gather more data and retry, accept the rejection,
+    or document the finding. The gate working is the gate doing its job.
 
 ---
 
@@ -454,13 +405,11 @@ Start the new chat with something like:
 > [paste contents of PROJECT_CONTEXT.md]
 
 Then in your second message, tell the new Claude what to do next.
-For Phase 4D: "We just finished Phase 4C. Ready to start Phase 4D — the block executor."
-
-If the work involves code, also paste current contents of any relevant scripts
-and a few sample rows from `flows_labeled.csv` (or the model JSON metadata if
-the task involves models).
+For Phase 5E: "We just finished Phase 5C/5D. Ready to start Phase 5E — the
+orchestration wrapper."
 
 ---
 
-*Last updated: end of Phase 4C. Phase 4D is the immediate next step.*
-*Update this file at the end of each phase or major milestone.*
+*Last updated: end of Phase 5C/5D, including Phase 5C empirical finding.*
+*Phase 5E (orchestration wrapper) is the immediate next step. After that:*
+*real armed-mode validation, then Phase 6 dashboard.*

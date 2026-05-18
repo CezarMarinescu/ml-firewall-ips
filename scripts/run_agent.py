@@ -229,7 +229,9 @@ def main():
     def on_flow(flow: dict):
         try:
             decision = engine.decide(flow)
-            result   = executor.handle(decision)
+            # Pass the full flow dict so block_executor can record all features
+            # in decisions.jsonl. Phase 5 retraining consumes this.
+            result   = executor.handle(decision, flow=flow)
             stats.record(result.outcome)
             line = format_line(decision, result, args.verbose)
             if line:

@@ -1,0 +1,19 @@
+{
+  "built_at": "2026-05-18T16:21:05.719194+00:00",
+  "since": null,
+  "until": null,
+  "allow_sample_rate": 0.05,
+  "queue_rows": 13,
+  "feature_columns": 19,
+  "stats": {
+    "total_seen": 97,
+    "outcome:ALLOW_NOOP": 80,
+    "skipped_sampled_out": 68,
+    "kept_sampled": 6,
+    "outcome:DRY_RUN_BLOCK": 11,
+    "outcome:WATCH_LOGGED": 6,
+    "kept_always": 11,
+    "skipped_no_flow": 0,
+    "skipped_finalized": 12
+  }
+}
